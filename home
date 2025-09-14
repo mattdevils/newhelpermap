@@ -1,0 +1,980 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import maplibregl from "maplibre-gl";
+import MapboxDraw from "@mapbox/mapbox-gl-draw";
+import * as turf from "@turf/turf"; // Voronoi + buffers
+import * as XLSX from "xlsx";
+import chroma from "chroma-js";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Download, Upload, MapPin, PaintBucket, Layers, Wand2, Focus, Bug, Shapes, Eye, Clipboard as ClipboardIcon, Link as LinkIcon } from "lucide-react";
+import "maplibre-gl/dist/maplibre-gl.css";
+import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
+
+// ================= Types =================
+type FSAInfo = { code: string; label?: string };
+type FSAMap = Record<string, string>; // FSA -> color hex
+
+// ================= Map constants =================
+const SK_CENTER: [number, number] = [-106.3468, 52.9399];
+const SK_BOUNDS: [[number, number], [number, number]] = [
+  [-110.1, 49.0],
+  [-101.3, 60.0],
+];
+
+// Minimal inline style for reliability (OSM raster tiles)
+const BASIC_STYLE: any = {
+  version: 8,
+  glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+  sources: {
+    osm: {
+      type: "raster",
+      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      tileSize: 256,
+      attribution: "© OpenStreetMap contributors",
+      maxzoom: 19,
+    },
+  },
+  layers: [{ id: "osm-basemap", type: "raster", source: "osm" }],
+};
+
+// Draw styles (avoid line-dasharray expressions)
+const DRAW_STYLES: any[] = [
+  { id: "gl-draw-polygon-fill-inactive", type: "fill", filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"], ["!=", "mode", "static"]], paint: { "fill-color": "#3bb2d0", "fill-outline-color": "#3bb2d0", "fill-opacity": 0.1 } },
+  { id: "gl-draw-polygon-stroke-inactive", type: "line", filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"], ["!=", "mode", "static"]], paint: { "line-color": "#3bb2d0", "line-width": 2 } },
+  { id: "gl-draw-line-inactive", type: "line", filter: ["all", ["==", "active", "false"], ["==", "$type", "LineString"], ["!=", "mode", "static"]], paint: { "line-color": "#3bb2d0", "line-width": 2 } },
+  { id: "gl-draw-polygon-fill-active", type: "fill", filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]], paint: { "fill-color": "#fbb03b", "fill-outline-color": "#fbb03b", "fill-opacity": 0.1 } },
+  { id: "gl-draw-polygon-stroke-active", type: "line", filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]], paint: { "line-color": "#fbb03b", "line-width": 2 } },
+  { id: "gl-draw-line-active", type: "line", filter: ["all", ["==", "active", "true"], ["==", "$type", "LineString"]], paint: { "line-color": "#fbb03b", "line-width": 2 } },
+  { id: "gl-draw-polygon-and-line-vertex-halo-active", type: "circle", filter: ["all", ["==", "$type", "Point"], ["==", "meta", "vertex"], ["==", "active", "true"]], paint: { "circle-radius": 7, "circle-color": "#fff" } },
+  { id: "gl-draw-polygon-and-line-vertex-active", type: "circle", filter: ["all", ["==", "$type", "Point"], ["==", "meta", "vertex"], ["==", "active", "true"]], paint: { "circle-radius": 5, "circle-color": "#fbb03b" } },
+  { id: "gl-draw-polygon-midpoint", type: "circle", filter: ["all", ["==", "$type", "Point"], ["==", "meta", "midpoint"]], paint: { "circle-radius": 3, "circle-color": "#fbb03b" } },
+  { id: "gl-draw-polygon-stroke-static", type: "line", filter: ["all", ["==", "mode", "static"], ["==", "$type", "Polygon"]], paint: { "line-color": "#404040", "line-width": 2 } },
+  { id: "gl-draw-line-static", type: "line", filter: ["all", ["==", "mode", "static"], ["==", "$type", "LineString"]], paint: { "line-color": "#404040", "line-width": 2 } },
+  { id: "gl-draw-point-static", type: "circle", filter: ["all", ["==", "mode", "static"], ["==", "$type", "Point"]], paint: { "circle-radius": 5, "circle-color": "#404040" } },
+];
+
+// ================= Demo centroid anchors (approximate) =================
+const FSA_CENTROIDS: Record<string, [number, number]> = {
+  // Regina
+  S4N: [-104.6189, 50.4452], S4P: [-104.6189, 50.4452], S4R: [-104.6189, 50.4452], S4S: [-104.6189, 50.4452],
+  S4T: [-104.6189, 50.4452], S4V: [-104.6189, 50.4452], S4W: [-104.6189, 50.4452], S4X: [-104.6189, 50.4452], S4Y: [-104.6189, 50.4452],
+  // Saskatoon
+  S7H: [-106.67, 52.1332], S7J: [-106.67, 52.1332], S7K: [-106.67, 52.1332], S7L: [-106.67, 52.1332],
+  S7M: [-106.67, 52.1332], S7N: [-106.67, 52.1332], S7P: [-106.67, 52.1332], S7R: [-106.67, 52.1332],
+  S7S: [-106.67, 52.1332], S7T: [-106.67, 52.1332], S7V: [-106.67, 52.1332], S7W: [-106.67, 52.1332],
+  // Moose Jaw
+  S6H: [-105.534, 50.391], S6J: [-105.534, 50.391],
+  // Prince Albert
+  S6V: [-105.75, 53.203], S6W: [-105.75, 53.203],
+  // Other cities/towns
+  S3N: [-102.461, 51.213], // Yorkton
+  S9H: [-107.797, 50.285], // Swift Current
+  S9A: [-108.297, 52.757], // North Battleford
+  S4A: [-103.016, 49.139], // Estevan
+  S4H: [-103.851, 49.661], // Weyburn
+  S9V: [-110.0, 53.278], // Lloydminster (SK side approx)
+  S9X: [-108.443, 54.131], // Meadow Lake
+  // Rural prefixes – approximate regional anchors
+  S0A: [-102.805, 50.931], S0C: [-102.38, 49.65], S0E: [-104.61, 52.9], S0G: [-103.784, 50.77],
+  S0J: [-105.301, 55.1], S0K: [-105.5, 52.3], S0L: [-109.16, 51.47], S0M: [-108.6, 53.0], S0N: [-108.4, 49.7], S0P: [-101.1, 54.77],
+};
+
+function radiusKmForFSA(code: string): number {
+  if (/^S7|^S4|^S6|^S9[A-HVX]/.test(code)) return 6; // city
+  if (/^S3N|^S9V/.test(code)) return 8; // mid-size
+  if (/^S0/.test(code)) return 30; // rural
+  return 12;
+}
+
+function buildPalette(fsas: string[]): FSAMap {
+  const unique = Array.from(new Set(fsas)).sort();
+  const scale = chroma.scale("Set3").mode("lab");
+  const colors: FSAMap = {};
+  unique.forEach((code, i) => {
+    const t = unique.length === 1 ? 0.5 : i / (unique.length - 1);
+    colors[code] = scale(t).hex();
+  });
+  return colors;
+}
+
+function readWorkbook(file: File): Promise<XLSX.WorkBook> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target?.result as ArrayBuffer);
+        const wb = XLSX.read(data, { type: "array" });
+        resolve(wb);
+      } catch (err) { reject(err); }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function fsasFromWorkbook(wb: XLSX.WorkBook): string[] {
+  const sheetName = wb.SheetNames.find((n) => n.toLowerCase().includes("fsa")) || wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: "" });
+  const fsas = rows.map((r) => String(r["FSA (prefix)"] || r["FSA"] || r["Prefix"] || "").trim().toUpperCase()).filter(Boolean);
+  const expanded: string[] = [];
+  fsas.forEach((v) => v.split(/[,;\s]+/).forEach((x) => { const code = x.replace(/[^A-Z0-9]/g, "").trim(); if (code) expanded.push(code); }));
+  return Array.from(new Set(expanded));
+}
+
+function featuresToCollection(draw: MapboxDraw): GeoJSON.FeatureCollection {
+  const fc = draw.getAll();
+  fc.features.forEach((f) => { if (!f.properties) f.properties = {} as any; if (typeof f.properties.fsa === "undefined") (f.properties as any).fsa = ""; });
+  return fc as GeoJSON.FeatureCollection;
+}
+
+function withinSK(lon: number, lat: number) {
+  return lon >= SK_BOUNDS[0][0] && lon <= SK_BOUNDS[1][0] && lat >= SK_BOUNDS[0][1] && lat <= SK_BOUNDS[1][1];
+}
+
+// ---- File saving helpers (robust across browsers & Canvas)
+function fsAccessAvailable(): boolean {
+  try {
+    const w: any = window as any;
+    if (!window.isSecureContext) return false;
+    if (window.self !== window.top) return false; // disallow in iframes/sandboxes
+    return typeof w.showSaveFilePicker === "function" || typeof w.showOpenFilePicker === "function";
+  } catch {
+    return false;
+  }
+}
+
+async function saveFile(filename: string, data: string, setStatus?: (s: string)=>void): Promise<boolean> {
+  try {
+    const blob = new Blob([data], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+    setStatus?.("Download started. If nothing happened, check popup/download blockers.");
+    return true;
+  } catch (e) {
+    console.error("saveFile error", e);
+    setStatus?.("Save failed. See console for details.");
+    return false;
+  }
+}
+
+// ================= Component =================
+export default function SaskatchewanFSAMapper() {
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const drawRef = useRef<MapboxDraw | null>(null);
+  const pinsRef = useRef<GeoJSON.FeatureCollection>({ type: "FeatureCollection", features: [] });
+
+  // Save/Load UI state
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<string>("");
+  const [fileHandle, setFileHandle] = useState<any>(null);
+  const [projectFilename, setProjectFilename] = useState<string>("");
+  const [downloadUrl, setDownloadUrl] = useState<string>("");
+  const [downloadName, setDownloadName] = useState<string>("asa_sask_project.json");
+  const openFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // ======== Sales reps + assignments ========
+  type Rep = { id: string; name: string; color: string };
+  const [reps, setReps] = useState<Rep[]>([
+    { id: "rep1", name: "SalesRep1", color: "#8dd3c7" },
+    { id: "rep2", name: "SalesRep2", color: "#ffffb3" },
+    { id: "rep3", name: "SalesRep3", color: "#bebada" },
+    { id: "rep4", name: "SalesRep4", color: "#fb8072" },
+  ]);
+  const [repByFSA, setRepByFSA] = useState<Record<string, string | null>>({});
+  const [selectedRepId, setSelectedRepId] = useState<string>("rep1");
+  const [assignMode, setAssignMode] = useState<boolean>(false);
+
+  // View modes: "both", "reps", "fsas"
+  const [viewMode, setViewMode] = useState<"both" | "reps" | "fsas">("both");
+
+  const [fsaList, setFsaList] = useState<FSAInfo[]>([]);
+  const [colorMap, setColorMap] = useState<FSAMap>({}); // still used for legend if desired
+  const [selectedFSA, setSelectedFSA] = useState<string>("");
+
+  const [activeFSA, setActiveFSA] = useState<string>("");
+  const [bboxByFSA, setBboxByFSA] = useState<Record<string, [number, number, number, number]>>({});
+  const [loadedGeojsonName, setLoadedGeojsonName] = useState<string>("");
+  const [diagnostics, setDiagnostics] = useState<string[]>([]);
+  const [zoneByFSA, setZoneByFSA] = useState<Record<string, number>>({});
+
+  // Legend layout controls
+  const [legendCols, setLegendCols] = useState<2 | 3 | 4>(3);
+  const [legendTextSize, setLegendTextSize] = useState<"sm" | "xs">("sm");
+
+  // Pin search UI
+  const [searchText, setSearchText] = useState<string>("");
+
+  // cleanup object URLs on change/unmount
+  useEffect(() => {
+    return () => { try { if (downloadUrl) URL.revokeObjectURL(downloadUrl); } catch {} };
+  }, [downloadUrl]);
+
+  // ---- init map ----
+  useEffect(() => {
+    if (mapRef.current || !containerRef.current) return;
+
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      style: BASIC_STYLE,
+      center: SK_CENTER,
+      zoom: 5.5,
+      maxBounds: SK_BOUNDS,
+      hash: true,
+      attributionControl: true,
+    });
+
+    const draw = new MapboxDraw({ displayControlsDefault: false, controls: { polygon: true, trash: true }, styles: DRAW_STYLES });
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+    map.addControl(draw as any, "top-left");
+
+    map.on("load", () => {
+      map.addSource("fsa-polys", { type: "geojson", promoteId: "id", data: { type: "FeatureCollection", features: [] } });
+
+      // FSA base (no color fill by default)
+      map.addLayer({ id: "fsa-fill", type: "fill", source: "fsa-polys", paint: { "fill-color": "#000000", "fill-opacity": 0.0, "fill-antialias": true } });
+      map.addLayer({ id: "fsa-outline", type: "line", source: "fsa-polys", paint: { "line-color": "#000", "line-width": 2.2, "line-opacity": 0.65 } });
+      map.addLayer({ id: "fsa-highlight", type: "line", source: "fsa-polys", paint: { "line-color": "#000", "line-width": 4 }, filter: ["==", ["get", "fsa"], "__none__"] });
+      // Labels: Zone N
+      map.addLayer({ id: "fsa-zone-labels", type: "symbol", source: "fsa-polys", layout: { "text-field": ["concat", "Zone ", ["to-string", ["get", "zoneIndex"]]], "text-size": 12, "text-allow-overlap": true }, paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.25 } });
+
+      // Rep overlay (painted by repId on each FSA)
+      map.addLayer({
+        id: "rep-fill",
+        type: "fill",
+        source: "fsa-polys",
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "repId"],
+            "rep1", reps[0]?.color || "#000000",
+            "rep2", reps[1]?.color || "#000000",
+            "rep3", reps[2]?.color || "#000000",
+            "rep4", reps[3]?.color || "#000000",
+            "#000000"
+          ],
+          "fill-opacity": 0.25
+        }
+      });
+      map.addLayer({ id: "rep-outline", type: "line", source: "fsa-polys", paint: { "line-color": "#000", "line-opacity": 0.35, "line-width": 1.2 } });
+
+      // Company pins
+      map.addSource("company-pins", { type: "geojson", data: pinsRef.current });
+      map.addLayer({ id: "company-pin", type: "circle", source: "company-pins", paint: { "circle-radius": 6, "circle-color": "#1f77b4", "circle-stroke-width": 2, "circle-stroke-color": "#fff" } });
+      map.addLayer({ id: "company-pin-label", type: "symbol", source: "company-pins", layout: { "text-field": ["get", "name"], "text-offset": [0, 1.1], "text-size": 12, "text-allow-overlap": true }, paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1 } });
+
+      // Assign-mode: clicking an FSA polygon assigns it to the selected rep
+      map.on("click", "fsa-fill", (e: any) => {
+        const code = e?.features?.[0]?.properties?.fsa as string | undefined;
+        if (!code) return;
+        if (assignMode) { setFSARep(code, selectedRepId); } else { focusFSA(code); }
+      });
+
+      try { map.fitBounds(SK_BOUNDS as any, { padding: { top: 10, bottom: 10, left: 10, right: 10 }, maxZoom: 5.8 }); } catch {}
+
+      applyViewMode(map, viewMode);
+    });
+
+    map.on("draw.create", () => updateFromDraw());
+    map.on("draw.update", () => updateFromDraw());
+    map.on("draw.delete", () => updateFromDraw());
+
+    function updateFromDraw() {
+      if (!mapRef.current || !drawRef.current) return;
+      const fc = featuresToCollection(drawRef.current);
+      fc.features = fc.features.map((f) => { const code = String((f.properties as any)?.fsa || "").toUpperCase(); (f.properties as any)._fillColor = colorMap[code] || "#cccccc"; (f.properties as any).repId = repByFSA[code] || null; return f; });
+      (mapRef.current.getSource("fsa-polys") as any).setData(fc);
+    }
+
+    mapRef.current = map; drawRef.current = draw;
+    return () => { map.remove(); mapRef.current = null; };
+  }, []);
+
+  // Keep map sized properly
+  useEffect(() => {
+    if (!containerRef.current || !mapRef.current) return;
+    const ro = new ResizeObserver(() => { try { mapRef.current!.resize(); } catch {} });
+    ro.observe(containerRef.current); return () => ro.disconnect();
+  }, [containerRef.current]);
+
+  // Default: back the view out a bit so the whole province is visible at load
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const t = setTimeout(() => { try { zoomToSK(); } catch {} }, 100);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Update rep overlay colors when reps change
+  useEffect(() => {
+    const map = mapRef.current; if (!map) return;
+    if (map.getLayer("rep-fill")) {
+      const expr: any[] = ["match", ["get", "repId"]];
+      reps.forEach((r) => { expr.push(r.id, r.color); });
+      expr.push("#000000");
+      try { map.setPaintProperty("rep-fill", "fill-color", expr as any); } catch {}
+    }
+  }, [reps]);
+
+  // View mode toggles
+  useEffect(() => { if (mapRef.current) applyViewMode(mapRef.current, viewMode); }, [viewMode]);
+
+  function applyViewMode(map: maplibregl.Map, mode: "both" | "reps" | "fsas") {
+    const showFSAOutline = mode !== "reps";
+    const showZoneLabels = mode !== "reps";
+    const fsaFillOpacity = mode === "fsas" ? 0.08 : 0.0;
+    const repOpacity = mode === "fsas" ? 0 : 0.25;
+    const repLineOpacity = mode === "fsas" ? 0 : 0.35;
+
+    try { map.setPaintProperty("fsa-fill", "fill-opacity", fsaFillOpacity); } catch {}
+    try { map.setPaintProperty("fsa-outline", "line-opacity", showFSAOutline ? 0.65 : 0); } catch {}
+    try { map.setLayoutProperty("fsa-zone-labels", "visibility", showZoneLabels ? "visible" : "none"); } catch {}
+    try { map.setPaintProperty("rep-fill", "fill-opacity", repOpacity); } catch {}
+    try { map.setPaintProperty("rep-outline", "line-opacity", repLineOpacity); } catch {}
+  }
+
+  // Highlight filter when a legend item/zone is selected
+  useEffect(() => {
+    const map = mapRef.current; if (!map) return;
+    if (map.getLayer("fsa-highlight")) {
+      const filt = activeFSA ? ["==", ["get", "fsa"], activeFSA] : ["==", ["get", "fsa"], "__none__"];
+      map.setFilter("fsa-highlight", filt as any);
+    }
+  }, [activeFSA]);
+
+  // --------- UI handlers ---------
+  async function handleWorkbookUpload(file: File) {
+    const wb = await readWorkbook(file);
+    const fsas = fsasFromWorkbook(wb);
+    const palette = buildPalette(fsas);
+    setFsaList(fsas.map((code) => ({ code })));
+    setColorMap(palette);
+    setSelectedFSA(fsas[0] || "");
+  }
+
+  function handleGeojsonUpload(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const fc = JSON.parse(String(reader.result)) as GeoJSON.FeatureCollection;
+        applyZonesToMap(fc); setLoadedGeojsonName(file.name);
+      } catch { alert("Could not parse GeoJSON. Ensure it is a valid FeatureCollection."); }
+    };
+    reader.readAsText(file);
+  }
+
+  function startDrawingZone() { drawRef.current?.changeMode("draw_polygon"); }
+  function stopDrawing() { drawRef.current?.changeMode("simple_select"); }
+  function deleteSelected() { try { drawRef.current?.trash(); } catch {} }
+  function clearAll() { try { drawRef.current?.deleteAll(); (mapRef.current?.getSource("fsa-polys") as any)?.setData({ type: "FeatureCollection", features: [] }); setZoneByFSA({}); } catch {} }
+
+  function tagSelectedWithFSA() {
+    if (!drawRef.current || !mapRef.current) return;
+    const ids = drawRef.current.getSelectedIds(); if (!ids.length) return alert("Select one or more drawn polygons first.");
+    const code = selectedFSA.toUpperCase();
+    ids.forEach((id) => {
+      const f = (drawRef.current as any).get(id); if (!f) return;
+      f.properties = { ...(f.properties || {}), fsa: code, repId: repByFSA[code] || null };
+      (drawRef.current as any).setFeatureProperty(id, "fsa", code);
+      (drawRef.current as any).setFeatureProperty(id, "repId", repByFSA[code] || null);
+    });
+    const fc = featuresToCollection(drawRef.current); (mapRef.current.getSource("fsa-polys") as any).setData(fc);
+  }
+
+  function exportGeoJSON() {
+    const src: any = mapRef.current?.getSource("fsa-polys");
+    const data = src?._data; if (data) {
+      // Prefer visible link in sandboxed envs
+      try {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/geo+json" });
+        if (downloadUrl) try { URL.revokeObjectURL(downloadUrl); } catch {}
+        const url = URL.createObjectURL(blob);
+        setDownloadUrl(url); setDownloadName("saskatchewan_fsa_regions.geojson");
+        setSaveStatus("Click the 'Download Project' button below to save the exported GeoJSON.");
+      } catch {
+        saveFile("saskatchewan_fsa_regions.geojson", JSON.stringify(data, null, 2), setSaveStatus);
+      }
+    }
+  }
+
+  // ---- Company pins: geocode + add/remove ----
+  function addPin(lon: number, lat: number, name: string, address?: string) {
+    const f: any = { type: "Feature", geometry: { type: "Point", coordinates: [lon, lat] }, properties: { name, address: address || "" } };
+    pinsRef.current.features.push(f);
+    try { (mapRef.current!.getSource("company-pins") as any).setData(pinsRef.current); } catch {}
+    try { mapRef.current!.easeTo({ center: [lon, lat], zoom: 12 }); } catch {}
+  }
+
+  async function geocodeAndPin(query: string) {
+    if (!query.trim()) return;
+    const q = `${query}, Saskatchewan, Canada`;
+    try {
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=5&lang=en`;
+      const res = await fetch(url);
+      const json: any = await res.json();
+      const feats: any[] = json?.features || [];
+      const first = feats.find((ft) => { const [lon, lat] = ft.geometry.coordinates; return withinSK(lon, lat); }) || feats[0];
+      if (!first) { alert("Couldn't find a match for that name. Try adding the city (e.g., 'Hitech Profiles, Regina')."); return; }
+      const [lon, lat] = first.geometry.coordinates;
+      const props = first.properties || {};
+      const name = props.name || query;
+      const addr = [props.street, props.housenumber, props.city || props.town || props.village, props.state].filter(Boolean).join(" ");
+      addPin(lon, lat, name, addr);
+    } catch (e) {
+      console.warn("Geocode error", e);
+      alert("Search failed. If it keeps happening, provide a city or an address, or try again later.");
+    }
+  }
+
+  function clearPins() {
+    pinsRef.current = { type: "FeatureCollection", features: [] } as any;
+    try { (mapRef.current!.getSource("company-pins") as any).setData(pinsRef.current); } catch {}
+  }
+
+  // --------- Auto-generation ---------
+  function autoGenerateZonesVoronoi() {
+    if (!mapRef.current) return;
+    const wanted = new Set(fsaList.map((f) => f.code.toUpperCase()));
+    const points: GeoJSON.Feature<GeoJSON.Point, any>[] = [];
+    const missing: string[] = [];
+    wanted.forEach((code) => { const c = FSA_CENTROIDS[code]; if (c) points.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { fsa: code } }); else missing.push(code); });
+    if (!points.length) { alert("I need anchor points for at least one of your FSAs. Try Circle buffers or import polygons."); return; }
+
+    if (points.length < 2) {
+      const only = points[0]; const km = radiusKmForFSA(only.properties?.fsa || "");
+      const circle = (turf as any).buffer(only, km, { units: "kilometers" });
+      circle.properties = { ...(circle.properties || {}), fsa: only.properties?.fsa || "", repId: repByFSA[only.properties?.fsa || ""] || null, method: "buffer-fallback", radius_km: km };
+      const bboxPoly = (turf as any).bboxPolygon([SK_BOUNDS[0][0], SK_BOUNDS[0][1], SK_BOUNDS[1][0], SK_BOUNDS[1][1]]);
+      const clipped = (turf as any).intersect(circle, bboxPoly) || circle;
+      applyZonesToMap({ type: "FeatureCollection", features: [clipped] });
+      setDiagnostics((d) => [`Auto-generated (Voronoi fallback): 1 zone. Missing anchors for ${missing.length} FSA(s).`, ...missing.map((m) => `No anchor for: ${m}`), ...d]);
+      return;
+    }
+
+    const fcPoints: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: points };
+    const bbox = [SK_BOUNDS[0][0], SK_BOUNDS[0][1], SK_BOUNDS[1][0], SK_BOUNDS[1][1]] as [number, number, number, number];
+    let vor: any = null; try { vor = (turf as any).voronoi(fcPoints, { bbox }); } catch (e: any) { console.warn("Voronoi error; falling back to buffers:", e?.message || e); autoGenerateZonesBuffers(); return; }
+    if (!vor || !vor.features) { alert("Voronoi generation failed."); return; }
+
+    const styled = vor.features.map((poly: any) => {
+      if (!poly) return null as any;
+      const center = (turf as any).centroid(poly).geometry.coordinates as [number, number];
+      let best: any = null, bestD = Infinity;
+      points.forEach((pt) => { const d = (turf as any).distance({ type: "Feature", geometry: { type: "Point", coordinates: center }, properties: {} }, pt); if (d < bestD) { bestD = d; best = pt; } });
+      const code = best?.properties?.fsa || "";
+      poly.properties = { ...(poly.properties || {}), fsa: code, repId: repByFSA[code] || null, method: "voronoi" };
+      return poly;
+    }).filter(Boolean);
+
+    applyZonesToMap({ type: "FeatureCollection", features: styled as any });
+    setDiagnostics((d) => [`Auto-generated (Voronoi): ${styled.length} zones. Missing anchors for ${missing.length} FSA(s).`, ...missing.map((m) => `No anchor for: ${m}`), ...d]);
+  }
+
+  function autoGenerateZonesBuffers() {
+    if (!mapRef.current) return;
+    const wanted = new Set(fsaList.map((f) => f.code.toUpperCase()));
+    const features: any[] = []; const missing: string[] = [];
+    wanted.forEach((code) => {
+      const c = FSA_CENTROIDS[code]; if (!c) { missing.push(code); return; }
+      const pt = (turf as any).point(c, { fsa: code });
+      const km = radiusKmForFSA(code);
+      let circle: any = null; try { circle = (turf as any).buffer(pt, km, { units: "kilometers" }); } catch (e) { console.warn("Buffer error for", code, e); return; }
+      circle.properties = { ...(circle.properties || {}), fsa: code, repId: repByFSA[code] || null, method: "buffer", radius_km: km };
+      features.push(circle);
+    });
+    if (!features.length) { alert("No FSAs had anchor points. Try importing official polygons."); return; }
+
+    const bboxPoly = (turf as any).bboxPolygon([SK_BOUNDS[0][0], SK_BOUNDS[0][1], SK_BOUNDS[1][0], SK_BOUNDS[1][1]]);
+    const clipped = features.map((f) => { try { return (turf as any).intersect(f, bboxPoly) || f; } catch { return f; } }).filter(Boolean);
+
+    applyZonesToMap({ type: "FeatureCollection", features: clipped as any });
+    setDiagnostics((d) => [`Auto-generated (Buffers): ${clipped.length} zones. Missing anchors for ${missing.length} FSA(s).`, ...missing.map((m) => `No anchor for: ${m}`), ...d]);
+  }
+
+  // --------- Core apply + index + auto-zoom ---------
+  function applyZonesToMap(fc: GeoJSON.FeatureCollection) {
+    const raw = (fc.features || []).filter((f: any) => !!f && !!f.geometry);
+
+    let features = raw.map((f: any, i: number) => {
+      // Clean geometry; rewind rings to avoid invisible fills
+      let geom: any = f.geometry;
+      try {
+        if ((turf as any).cleanCoords) geom = (turf as any).cleanCoords(f).geometry;
+        if ((turf as any).rewind) geom = (turf as any).rewind({ type: "Feature", geometry: geom, properties: {} }, { reverse: true }).geometry;
+      } catch {}
+
+      const code = (f.properties?.fsa || "").toUpperCase();
+      const props = { ...(f.properties || {}) } as any; props.fsa = code; props.repId = repByFSA[code] || props.repId || null;
+      return { type: "Feature", geometry: geom, properties: props, id: i } as any;
+    }).filter((f: any) => !!f.geometry && (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon"));
+
+    // Compute Zone numbering (top-left -> bottom-right) using centroids
+    const centroids = features.map((f: any) => ({
+      code: (f.properties?.fsa || "").toUpperCase(),
+      center: (turf as any).centroid(f).geometry.coordinates as [number, number],
+    }));
+    centroids.sort((a, b) => {
+      // y: lat descending (north first), x: lon ascending (west first)
+      if (a.center[1] !== b.center[1]) return b.center[1] - a.center[1];
+      return a.center[0] - b.center[0];
+    });
+    const zoneMap: Record<string, number> = {};
+    centroids.forEach((c, i) => { zoneMap[c.code] = i + 1; });
+
+    features = features.map((f: any) => ({ ...f, properties: { ...(f.properties || {}), zoneIndex: zoneMap[(f.properties?.fsa || "").toUpperCase()] || null } }));
+
+    const bboxIndex: Record<string, [number, number, number, number]> = {} as any;
+    let globalBBox: [number, number, number, number] | null = null;
+    features.forEach((f: any) => {
+      const code = (f.properties?.fsa || "").toUpperCase();
+      const b = (turf as any).bbox(f) as [number, number, number, number];
+      if (!bboxIndex[code]) bboxIndex[code] = b; else bboxIndex[code] = [Math.min(bboxIndex[code][0], b[0]), Math.min(bboxIndex[code][1], b[1]), Math.max(bboxIndex[code][2], b[2]), Math.max(bboxIndex[code][3], b[3])];
+      if (!globalBBox) globalBBox = b; else globalBBox = [Math.min(globalBBox[0], b[0]), Math.min(globalBBox[1], b[1]), Math.max(globalBBox[2], b[2]), Math.max(globalBBox[3], b[3])];
+    });
+
+    (mapRef.current!.getSource("fsa-polys") as any).setData({ type: "FeatureCollection", features });
+    setBboxByFSA(bboxIndex);
+    setZoneByFSA(zoneMap);
+
+    // Keep labels visible based on current mode
+    try { applyViewMode(mapRef.current!, viewMode); } catch {}
+
+    try {
+      const bb = globalBBox || [SK_BOUNDS[0][0], SK_BOUNDS[0][1], SK_BOUNDS[1][0], SK_BOUNDS[1][1]];
+      mapRef.current!.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]] as any, { padding: 10, maxZoom: 6.2 });
+    } catch {}
+  }
+
+  function setFSARep(code: string, repId: string) {
+    setRepByFSA((prev) => ({ ...prev, [code]: repId }));
+    const src: any = mapRef.current?.getSource("fsa-polys");
+    const data = src?._data as GeoJSON.FeatureCollection | undefined; if (!data) return;
+    const newFeatures = (data.features || []).map((f: any) => ({ ...f, properties: { ...(f.properties || {}), repId: (f.properties?.fsa || "") === code ? repId : f.properties?.repId ?? null } }));
+    try { src.setData({ type: "FeatureCollection", features: newFeatures }); } catch {}
+  }
+
+  // --------- Project Save/Load (local only) ---------
+  function serializeProject(): string {
+    const fsaSrc: any = mapRef.current?.getSource("fsa-polys");
+    const fsaData = (fsaSrc?._data as any) || { type: "FeatureCollection", features: [] };
+    const project = {
+      version: 3,
+      reps,
+      repByFSA,
+      zones: fsaData,
+      pins: pinsRef.current,
+      viewMode,
+    };
+    return JSON.stringify(project, null, 2);
+  }
+
+  async function ensureWritePermission(handle: any): Promise<boolean> {
+    try {
+      if (!handle) return false;
+      if (typeof handle.queryPermission === "function") {
+        const q = await handle.queryPermission({ mode: "readwrite" as any });
+        if (q === "granted") return true;
+      }
+      if (typeof handle.requestPermission === "function") {
+        const r = await handle.requestPermission({ mode: "readwrite" as any });
+        return r === "granted";
+      }
+    } catch {}
+    return true; // some browsers don't support permissions API but still write
+  }
+
+  async function saveToHandle(handle: any, data: string) {
+    const ok = await ensureWritePermission(handle);
+    if (!ok) throw new Error("Write permission denied.");
+    const writable = await handle.createWritable();
+    await writable.write(new Blob([data], { type: "application/json" }));
+    await writable.close();
+  }
+
+  function prepareDownload(data: string, suggestedName: string) {
+    try {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    } catch {}
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    setDownloadUrl(url);
+    setDownloadName(suggestedName || "asa_sask_project.json");
+    setSaveStatus("Click the 'Download Project' button below to save the file locally. If clicking doesn't work, right‑click and choose 'Save link as…'.");
+  }
+
+  async function copyProjectToClipboard() {
+    try {
+      const data = serializeProject();
+      await navigator.clipboard.writeText(data);
+      setSaveStatus("Project JSON copied to clipboard.");
+    } catch {
+      setSaveStatus("Clipboard copy failed (browser denied). Use the Download button below.");
+    }
+  }
+
+  async function saveAsProject() {
+    setSaving(true); setSaveStatus("");
+    try {
+      const data = serializeProject();
+      const w: any = window as any;
+      if (fsAccessAvailable()) {
+        try {
+          const handle = await w.showSaveFilePicker({
+            suggestedName: projectFilename || "asa_sask_project.json",
+            types: [{ description: "JSON Project", accept: { "application/json": [".json"] } }]
+          });
+          await saveToHandle(handle, data);
+          setFileHandle(handle);
+          try { const f = await handle.getFile(); setProjectFilename(f?.name || ""); } catch { setProjectFilename("asa_sask_project.json"); }
+          setSaveStatus("Saved to selected location.");
+          return;
+        } catch (err) {
+          console.warn("showSaveFilePicker blocked, falling back to visible link", err);
+        }
+      }
+      // Fallback: visible link the user can click
+      prepareDownload(data, projectFilename || "asa_sask_project.json");
+    } catch (e) {
+      console.error(e); setSaveStatus("Save failed. See console for details."); alert("Save failed. See console for details.");
+    } finally { setSaving(false); }
+  }
+
+  async function quickSaveProject() {
+    setSaving(true); setSaveStatus("");
+    try {
+      const data = serializeProject();
+      const w: any = window as any;
+      if (fileHandle && typeof fileHandle.createWritable === "function") {
+        await saveToHandle(fileHandle, data);
+        setSaveStatus(projectFilename ? `Saved ${projectFilename}.` : "Saved.");
+      } else if (fsAccessAvailable()) {
+        // First-time quick save can use the picker
+        try {
+          const handle = await w.showSaveFilePicker({
+            suggestedName: projectFilename || "asa_sask_project.json",
+            types: [{ description: "JSON Project", accept: { "application/json": [".json"] } }]
+          });
+          await saveToHandle(handle, data);
+          setFileHandle(handle);
+          try { const f = await handle.getFile(); setProjectFilename(f?.name || ""); } catch {}
+          setSaveStatus("Saved to selected location.");
+        } catch (err) {
+          console.warn("Picker blocked, falling back to visible link", err);
+          prepareDownload(data, projectFilename || "asa_sask_project.json");
+        }
+      } else {
+        // Fallback: visible link
+        prepareDownload(data, projectFilename || "asa_sask_project.json");
+      }
+    } catch (e) {
+      console.error(e); setSaveStatus("Save failed. See console for details."); alert("Save failed. See console for details.");
+    } finally { setSaving(false); }
+  }
+
+  async function openProjectWithPicker() {
+    try {
+      const w: any = window as any;
+      if (fsAccessAvailable()) {
+        try {
+          const [handle] = await w.showOpenFilePicker({
+            multiple: false,
+            types: [{ description: "JSON Project", accept: { "application/json": [".json"] } }]
+          });
+          const file = await handle.getFile();
+          setFileHandle(handle);
+          setProjectFilename(file?.name || "");
+          const text = await file.text();
+          const json = JSON.parse(text);
+          if (json.reps) setReps(json.reps);
+          if (json.repByFSA) setRepByFSA(json.repByFSA);
+          if (json.pins) { pinsRef.current = json.pins; try { (mapRef.current!.getSource("company-pins") as any).setData(pinsRef.current); } catch {} }
+          if (json.zones) applyZonesToMap(json.zones);
+          if (json.viewMode) try { setViewMode(json.viewMode); } catch {}
+          setSaveStatus("Project loaded.");
+          return;
+        } catch (err) {
+          console.warn("showOpenFilePicker blocked, falling back to input", err);
+          // fall through to input below
+        }
+      }
+      // Fallback to hidden input
+      openFileInputRef.current?.click();
+    } catch (e) {
+      console.error(e); alert("Open failed.");
+    }
+  }
+
+  function handleOpenInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]; if (!f) return;
+    setProjectFilename(f.name);
+    loadProject(f);
+    e.target.value = ""; // reset for next time
+  }
+
+  function loadProject(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const json = JSON.parse(String(reader.result));
+        if (json.reps) setReps(json.reps);
+        if (json.repByFSA) setRepByFSA(json.repByFSA);
+        if (json.pins) { pinsRef.current = json.pins; try { (mapRef.current!.getSource("company-pins") as any).setData(pinsRef.current); } catch {} }
+        if (json.zones) applyZonesToMap(json.zones);
+        if (json.viewMode) try { setViewMode(json.viewMode); } catch {}
+        setSaveStatus("Project loaded.");
+      } catch (e) { alert("Not a valid project file."); setSaveStatus("Load failed — invalid file."); }
+    };
+    reader.readAsText(file);
+  }
+
+  // --------- Diagnostics ---------
+  function runDiagnostics() {
+    const msgs: string[] = [];
+    msgs.push(mapRef.current ? "✔ Map initialized" : "✖ Map missing");
+    msgs.push(drawRef.current ? "✔ Draw attached" : "✖ Draw missing");
+    msgs.push(fsAccessAvailable() ? "✔ File System Access API usable" : "ℹ Using visible download link fallback for Save/Open (picker not allowed in this environment)");
+    try { msgs.push(navigator.clipboard ? "✔ Clipboard API available" : "ℹ Clipboard API not available"); } catch {}
+    if (mapRef.current) {
+      const c = mapRef.current.getContainer();
+      const tl = c.querySelector(".maplibregl-ctrl-top-left");
+      const drawCtrl = c.querySelector(".maplibregl-ctrl-top-left .mapboxgl-ctrl");
+      const polyBtn = c.querySelector('[class*="mapbox-gl-draw_polygon"]');
+      msgs.push(tl ? "✔ Top-left control container present" : "✖ Missing top-left control container");
+      msgs.push(drawCtrl ? "✔ Draw toolbar present" : "✖ Draw toolbar not found (CSS or mounting issue)");
+      msgs.push(polyBtn ? "✔ Polygon button found" : "✖ Polygon button not found");
+      const src: any = (mapRef.current as any).getSource("fsa-polys");
+      if (src && src._data && src._data.features) {
+        const n = src._data.features.length; msgs.push(`✔ Current zone features: ${n}`);
+        const f = src._data.features[0]; if (f) msgs.push(`ℹ sample feature fsa=${f.properties?.fsa} zone=${f.properties?.zoneIndex} rep=${f.properties?.repId ?? "(none)"}`);
+      }
+      try { const pins: any = (mapRef.current as any).getSource("company-pins"); const nPins = pins?._data?.features?.length ?? 0; msgs.push(`✔ Company pins: ${nPins}`); } catch {}
+      try { msgs.push(`✔ Current zoom ${mapRef.current.getZoom().toFixed(2)}`); } catch {}
+      msgs.push(`✔ View mode: ${viewMode}`);
+    }
+    try { const km = radiusKmForFSA("S7K"); const circle = (turf as any).buffer({ type: "Feature", geometry: { type: "Point", coordinates: [-106.67, 52.1332] }, properties: {} } as any, km, { units: "kilometers" }); msgs.push(circle?.type === "Feature" ? "✔ Fallback buffer test passed" : "✖ Fallback buffer test failed"); } catch { msgs.push("✖ Fallback buffer test errored"); }
+    try { const parsed = JSON.parse(serializeProject()); msgs.push(parsed?.version ? "✔ Project serializes to JSON" : "✖ Project JSON missing version"); } catch { msgs.push("✖ serializeProject() JSON parse failed"); }
+    setDiagnostics(msgs);
+  }
+
+  function focusFSA(code: string) {
+    setActiveFSA(code);
+    const bb = bboxByFSA[code]; if (bb && mapRef.current) mapRef.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]] as any, { padding: 24, maxZoom: 10 });
+  }
+
+  const legend = useMemo(() => {
+    const codes = Object.keys(zoneByFSA).length
+      ? Object.keys(zoneByFSA).sort((a, b) => (zoneByFSA[a] || 0) - (zoneByFSA[b] || 0))
+      : Object.keys(colorMap).sort();
+    const textClass = legendTextSize === "xs" ? "text-xs" : "text-sm";
+
+    return codes.map((code) => {
+      const repId = repByFSA[code];
+      const rep = reps.find((r) => r.id === repId);
+      return (
+        <button
+          key={code}
+          onClick={() => (assignMode ? setFSARep(code, selectedRepId) : focusFSA(code))}
+          title={assignMode ? `Assign ${code} to ${reps.find((r) => r.id === selectedRepId)?.name}` : `Zoom to ${code}`}
+          className={`flex items-center gap-2 ${textClass} text-left px-1.5 py-1 rounded border hover:bg-muted min-w-0 ${activeFSA === code ? "ring-1 ring-primary/60" : ""}`}
+       >
+          <span className="w-3.5 h-3.5 rounded-md border shrink-0 bg-white" />
+          <span className="font-mono shrink-0">Zone {zoneByFSA[code] ?? "?"}</span>
+          <span className="text-[11px] text-muted-foreground shrink-0">({code})</span>
+          {repId && (
+            <span
+              className="ml-auto text-[11px] px-1 py-0.5 rounded max-w-[8.5rem] truncate whitespace-nowrap"
+              style={{ background: rep?.color || "#eee" }}
+              title={rep?.name || repId}
+            >
+              {rep?.name || repId}
+            </span>
+          )}
+        </button>
+      );
+    });
+  }, [zoneByFSA, activeFSA, assignMode, selectedRepId, repByFSA, reps, colorMap, legendTextSize]);
+
+  function zoomToSK() {
+    if (!mapRef.current) return;
+    mapRef.current.fitBounds(SK_BOUNDS as any, { padding: { top: 10, bottom: 10, left: 10, right: 10 }, maxZoom: 5.8 });
+  }
+
+  const legendGridClass =
+    legendCols === 2
+      ? "grid grid-cols-2 gap-2 max-h-44 overflow-auto pr-1"
+      : legendCols === 4
+      ? "grid grid-cols-4 gap-2 max-h-44 overflow-auto pr-1"
+      : "grid grid-cols-3 gap-2 max-h-44 overflow-auto pr-1";
+
+  return (
+    <div className="w-full h-screen grid grid-cols-12 gap-4 p-4 overflow-hidden">
+      <div className="col-span-4 space-y-4 h-full overflow-auto">
+        <h1 className="text-2xl font-semibold">Saskatchewan FSA Region Mapper</h1>
+        <p className="text-sm text-muted-foreground">FSA layer is the permanent base (black outlines + "Zone N" labels). Sales-rep colors sit on top and are reassignable.</p>
+
+        {/* View mode */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Eye className="w-4 h-4"/>View</div>
+          <div className="flex gap-2">
+            <Button variant={viewMode==='both'? 'default':'secondary'} onClick={()=>setViewMode('both')}>Both</Button>
+            <Button variant={viewMode==='reps'? 'default':'secondary'} onClick={()=>setViewMode('reps')}>Reps only</Button>
+            <Button variant={viewMode==='fsas'? 'default':'secondary'} onClick={()=>setViewMode('fsas')}>FSAs only</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">Reps only hides FSA outlines/labels. FSAs only hides the colored rep overlay.</p>
+        </CardContent></Card>
+
+        {/* Project Save/Load */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Download className="w-4 h-4"/>Project</div>
+          <div className="flex flex-wrap gap-2 items-center">
+            <Button onClick={saveAsProject} disabled={saving}>Save As…</Button>
+            <Button onClick={quickSaveProject} disabled={saving}>{saving ? "Saving…" : "Save"}</Button>
+            <Button variant="secondary" onClick={openProjectWithPicker}>Open File</Button>
+            <input ref={openFileInputRef} type="file" accept=".json,application/json" className="hidden" onChange={handleOpenInputChange} />
+          </div>
+          {downloadUrl && (
+            <div className="flex items-center gap-2 mt-2">
+              <a href={downloadUrl} download={downloadName} className="inline-flex items-center gap-2 px-3 py-2 rounded-md border hover:bg-muted">
+                <LinkIcon className="w-4 h-4"/> Download Project
+              </a>
+              <Button variant="secondary" onClick={copyProjectToClipboard}><ClipboardIcon className="w-4 h-4 mr-1"/>Copy JSON</Button>
+            </div>
+          )}
+          <div className="text-xs text-muted-foreground space-y-1">
+            <div>Current file: <span className="font-mono">{projectFilename || "(none)"}</span></div>
+            {saveStatus && <div>{saveStatus}</div>}
+            <p>
+              If your browser blocks automatic downloads, use the <strong>Download Project</strong> link above. You can also <strong>Copy JSON</strong> and paste it into a file named <span className="font-mono">.json</span>.
+            </p>
+          </div>
+        </CardContent></Card>
+
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Upload className="w-4 h-4"/>Load FSAs from Excel/CSV</div>
+          <Input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleWorkbookUpload(f); }} />
+          <p className="text-xs text-muted-foreground">Use the FSAs sheet from the file I generated or import official polygons below.</p>
+        </CardContent></Card>
+
+        {/* Reps manager */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium">Sales rep territories</div>
+          <div className="flex items-center gap-2 text-sm">
+            <label className="inline-flex items-center gap-1">
+              <input type="checkbox" checked={assignMode} onChange={(e)=>setAssignMode(e.target.checked)} /> Assign mode
+            </label>
+          </div>
+          <div className="space-y-2">
+            {reps.map((r)=> (
+              <div key={r.id} className={`flex items-center gap-2 p-2 rounded ${selectedRepId===r.id?"bg-muted":""}`}>
+                <input className="w-28 border rounded px-2 py-1 text-sm" value={r.name} onChange={(e)=>setReps(rs=>rs.map(x=>x.id===r.id?{...x,name:e.target.value}:x))} />
+                <input type="color" value={r.color} onChange={(e)=>setReps(rs=>rs.map(x=>x.id===r.id?{...x,color:e.target.value}:x))} />
+                <Button size="sm" variant={selectedRepId===r.id?"default":"secondary"} onClick={()=>setSelectedRepId(r.id)}>Active</Button>
+                <span className="text-xs ml-auto">FSAs: {Object.values(repByFSA).filter(v=>v===r.id).length}</span>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">With <strong>Assign mode</strong> on: click an FSA in the legend or on the map to assign it to the active rep.</p>
+        </CardContent></Card>
+
+        {/* Import Official Polygons */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Layers className="w-4 h-4"/>Import Existing FSA Polygons (GeoJSON)</div>
+          <Input type="file" accept=".geojson,application/geo+json,application/json" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleGeojsonUpload(f); }} />
+          {loadedGeojsonName && <p className="text-xs">Loaded: <span className="font-mono">{loadedGeojsonName}</span></p>}
+          <p className="text-xs text-muted-foreground">For exact postal areas, import official FSA polygons and they’ll adopt your rep assignments and show Zone labels.</p>
+        </CardContent></Card>
+
+        {/* Auto-generate Zones */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Shapes className="w-4 h-4"/>Auto‑generate Zones (no drawing)</div>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={autoGenerateZonesVoronoi}>Auto‑generate (Voronoi)</Button>
+            <Button variant="secondary" onClick={autoGenerateZonesBuffers}>Auto‑generate (Circle buffers)</Button>
+          </div>
+          <ul className="text-xs text-muted-foreground list-disc list-inside space-y-1">
+            <li><strong>Voronoi</strong>: splits SK so each zone is closest to its FSA anchor point.</li>
+            <li><strong>Circle buffers</strong>: radius around each anchor (bigger for S0*), clipped to SK.</li>
+            <li>These are quick approximations. Import official polygons for precise boundaries.</li>
+          </ul>
+        </CardContent></Card>
+
+        {/* Company pinning */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><MapPin className="w-4 h-4"/>Add company pins</div>
+          <div className="flex gap-2">
+            <Input value={searchText} onChange={(e) => setSearchText(e.target.value)} placeholder="e.g., Hitech Profiles, Regina"/>
+            <Button onClick={() => geocodeAndPin(searchText)}>Add pin</Button>
+            <Button variant="secondary" onClick={clearPins}>Clear pins</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">Search OpenStreetMap/Photon for the name (include the city), drop a pin, and zoom to it.</p>
+        </CardContent></Card>
+
+        {/* FSA tagging helper */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><PaintBucket className="w-4 h-4"/>Tag Selection with FSA</div>
+          <div className="flex items-center gap-2">
+            <Select value={selectedFSA} onValueChange={(v) => setSelectedFSA(v)}>
+              <SelectTrigger className="w-full"><SelectValue placeholder="Choose FSA"/></SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel>Loaded FSAs</SelectLabel>
+                  {fsaList.map((f) => (<SelectItem key={f.code} value={f.code}>{f.code}</SelectItem>))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Button className="shrink-0" onClick={tagSelectedWithFSA}><Wand2 className="w-4 h-4 mr-1"/>Apply</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">Select polygon(s) then click <em>Apply</em> to set their <span className="font-mono">fsa</span> and keep rep assignment.</p>
+        </CardContent></Card>
+
+        {/* Export + Legend */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Download className="w-4 h-4"/>Export</div>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={exportGeoJSON}>Export FSA GeoJSON</Button>
+            <Button onClick={zoomToSK}><Focus className="w-4 h-4 mr-1"/>Zoom to SK</Button>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium">Legend (click to {assignMode?"assign":"focus"})</div>
+              <div className="flex items-center gap-1 text-xs">
+                <span>Cols:</span>
+                <Button size="sm" variant={legendCols===2?"default":"secondary"} onClick={()=>setLegendCols(2)}>2</Button>
+                <Button size="sm" variant={legendCols===3?"default":"secondary"} onClick={()=>setLegendCols(3)}>3</Button>
+                <span className="ml-2">Text:</span>
+                <Button size="sm" variant={legendTextSize==="xs"?"default":"secondary"} onClick={()=>setLegendTextSize("xs")}>Small</Button>
+                <Button size="sm" variant={legendTextSize==="sm"?"default":"secondary"} onClick={()=>setLegendTextSize("sm")}>Normal</Button>
+              </div>
+            </div>
+            <div className={legendGridClass}>{legend}</div>
+          </div>
+        </CardContent></Card>
+
+        {/* Diagnostics */}
+        <Card className="rounded-2xl shadow"><CardContent className="p-4 space-y-3">
+          <div className="font-medium flex items-center gap-2"><Bug className="w-4 h-4"/>Diagnostics</div>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={runDiagnostics}>Run diagnostics</Button>
+          </div>
+          {diagnostics.length > 0 && (
+            <ul className="text-xs mt-2 list-disc list-inside space-y-1">
+              {diagnostics.map((m, i) => (<li key={i}>{m}</li>))}
+            </ul>
+          )}
+        </CardContent></Card>
+      </div>
+
+      <div className="col-span-8 h-full">
+        <div ref={containerRef} className="w-full h-full rounded-2xl shadow" />
+      </div>
+    </div>
+  );
+}
